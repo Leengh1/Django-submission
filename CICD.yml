@@ -1,0 +1,273 @@
+name: Django App
+
+on:
+  push:
+    branches: [ dev, main]
+  workflow_dispatch: 
+
+jobs:
+
+  get-version:
+   runs-on: ubuntu-latest
+   steps:
+     - name: Checkout
+       uses: actions/checkout@v4
+
+     - name: Extract Version 
+       run: |
+        VERSION=$(python3 -c "
+        import re
+        with open('pyproject.toml') as f:
+            content = f.read()
+        match = re.search(r'version\s*=\s*\"([^\"]+)\"', content)
+        print(match.group(1))
+        ")
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "version: \"$VERSION\"" > version.yaml
+        ls -l
+
+     - name: Debugging the version
+       run: echo $VERSION
+
+     - name: Upload Version artifact
+       uses: actions/upload-artifact@v4
+       with:
+         name: version
+         path: version.yaml
+
+
+  build:
+   runs-on: ubuntu-latest
+   needs: get-version
+   steps:
+     - name: Checkout
+       uses: actions/checkout@v4
+
+     - name: Download artifact
+       uses: actions/download-artifact@v4
+       with:
+           name: version
+
+     - name: Load version into enviroment
+       run: |
+          VERSION=$(grep 'version' version.yaml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          
+     - name: Install Poetry
+       run: pip install poetry
+
+     - name: Build artifact
+       run: poetry build
+
+     - name: Package artifact
+       run: |
+         mkdir -p artifacts
+         WHEEL=$(ls dist/*.whl)
+         mv "$WHEEL" "artifacts/book-shop-${VERSION}-${GITHUB_SHA:0:7}.whl"
+
+     - name: Upload artifacts
+       uses: actions/upload-artifact@v4
+       with:
+         name: django-app
+         path: artifacts/*
+
+  docker:
+   runs-on: ubuntu-latest
+   needs: build
+   steps:
+     - name: Checkout
+       uses: actions/checkout@v4 
+
+     - name: Download artifact
+       uses: actions/download-artifact@v4
+       with:
+           name: version
+
+     - name: Load version into environment
+       run: |
+          VERSION=$(grep 'version' version.yaml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+     - name: Download artifact
+       uses: actions/download-artifact@v4
+       with:
+        name: django-app
+        path: dist
+
+     - name: Extract app artifact
+       run: |
+          mkdir -p app
+          ARTIFACT=$(ls -1 dist/*.whl | tail -n 1)
+          echo "Artifact found: $ARTIFACT"
+          cp "$ARTIFACT" app/  
+          ls -l app
+
+     - name: Config AWS credentials
+       uses: aws-actions/configure-aws-credentials@v4
+       with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+     - name: login into AWS ECR
+       uses: aws-actions/amazon-ecr-login@v2
+
+     - name : Build and push Image
+       uses: docker/build-push-action@v6
+       with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ secrets.AWS_ECR_URL }}/book-shop:${{ env.VERSION }}-snapshot
+
+  get-latest-image:
+   runs-on: ubuntu-latest
+   outputs:
+      latest_tag: ${{ steps.extractlatest.outputs.LATEST_TAG }}
+   needs: docker 
+   steps:
+       - name: Config AWS credentials
+         uses: aws-actions/configure-aws-credentials@v4
+         with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+    
+       - name: login into AWS ECR
+         uses: aws-actions/amazon-ecr-login@v2
+            
+       - name: Get latest image with snapshot tag
+         id: extractlatest 
+         run: |
+          LATEST_TAG=$(aws ecr describe-images \
+            --repository-name book-shop \
+            --region ${{ secrets.AWS_REGION }} \
+            --output json \
+          | jq -r '
+              .imageDetails[]
+              | select(.imageTags != null)
+              | select([.imageTags[] | contains("snapshot")] | any)
+              | {pushedAt: .imagePushedAt, tag: (.imageTags[] | select(contains("snapshot")))}
+            ' | jq -s 'sort_by(.pushedAt) | last.tag')
+
+          LATEST_TAG=$(echo "$LATEST_TAG" | tr -d '"')
+          echo "LATEST_TAG = $LATEST_TAG"
+          echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+
+  promote:
+   runs-on: ubuntu-latest
+   if: github.ref == 'refs/heads/main'
+   outputs:
+     base_tag: ${{ steps.extractbase.outputs.BASE_TAG }}
+   needs: get-latest-image
+   steps:
+       - name: Config AWS credentials
+         uses: aws-actions/configure-aws-credentials@v4
+         with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+    
+       - name: login into AWS ECR
+         uses: aws-actions/amazon-ecr-login@v2
+
+       - name: Get base image
+         id: extractbase 
+         run: |
+          BASE_TAG=$(echo "${{ needs.get-latest-image.outputs.latest_tag }}" | cut -d'-' -f1)
+          echo "BASE_TAG = $BASE_TAG"
+          echo "BASE_TAG=$BASE_TAG" >> $GITHUB_OUTPUT
+     
+       - name: Tag & push promoted image
+         run: |
+            echo ${{ needs.get-latest-image.outputs.latest_tag }}
+            docker pull ${{ secrets.AWS_ECR_URL }}/book-shop:${{ needs.get-latest-image.outputs.latest_tag }}
+            docker tag ${{ secrets.AWS_ECR_URL }}/book-shop:${{ needs.get-latest-image.outputs.latest_tag }} \
+                      ${{ secrets.AWS_ECR_URL }}/book-shop:${{ steps.extractbase.outputs.base_tag }}
+            docker push ${{ secrets.AWS_ECR_URL }}/book-shop:${{ steps.extractbase.outputs.base_tag }}
+
+  deploy-dev:
+    runs-on: ubuntu-latest  
+    if: github.ref == 'refs/heads/dev'
+    needs: get-latest-image 
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+           name: version
+
+      - name: Load version into enviroment
+        run: |
+          VERSION=$(grep 'version' version.yaml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: ssh to the server
+        uses: appleboy/ssh-action@v1.0.3
+        with:  
+          host: ${{ secrets.HOST }} 
+          username: ${{ secrets.HOST_NAME }}
+          key: ${{ secrets.KEY }}
+          script: | 
+           export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+           export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+           export AWS_REGION=${{ secrets.AWS_REGION }}
+           export ACCOUNT_ID=${{ secrets.ACCOUNT_ID }}
+
+           aws ecr get-login-password --region $AWS_REGION \
+             | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+           docker pull $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/book-shop:${{ env.VERSION }}-snapshot
+           
+           docker stop bookshop-snapshot 
+           docker rm bookshop-snapshot 
+           docker run -d \
+            -e PORT=4000 \
+            -p 8080:4000 \
+            --name bookshop-snapshot \
+            ${{ secrets.AWS_ECR_URL }}/book-shop:${{ env.VERSION }}-snapshot
+            
+  deploy-prod:
+    runs-on: ubuntu-latest  
+    if: github.ref == 'refs/heads/main'
+    needs: get-latest-image
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: version
+
+      - name: Load version into environment
+        run: |
+          VERSION=$(grep 'version' version.yaml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: SSH to the server and deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:  
+          host: ${{ secrets.HOST }} 
+          username: ${{ secrets.HOST_NAME }}
+          key: ${{ secrets.KEY }}
+          script: | 
+            export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            export AWS_REGION=${{ secrets.AWS_REGION }}
+            export ACCOUNT_ID=${{ secrets.ACCOUNT_ID }}
+
+            # Login to ECR
+            aws ecr get-login-password --region $AWS_REGION \
+              | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+            # Pull promoted image (without snapshot)
+            docker pull $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/book-shop:${{ env.VERSION }}
+
+            # Stop and remove old container
+            docker stop bookshop-prod || true
+            docker rm bookshop-prod || true
+
+            # Run new container
+            docker run -d \
+              -e PORT=3000 \
+              -p 80:3000 \
+              --name bookshop-prod \
+              ${{ secrets.AWS_ECR_URL }}/book-shop:${{ env.VERSION }}
